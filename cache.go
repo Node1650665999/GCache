@@ -18,7 +18,6 @@ func (f DataFunc) Get(key string) ([]byte, error) {
 }
 
 var (
-	mu     sync.RWMutex
 	caches = make(map[string]*Cache)
 )
 
@@ -27,6 +26,7 @@ type Cache struct {
 	namespace  string //缓存的命名空间, 比如学生和动物都有年龄,但一个 age 字段无法存储两个值,因此就需要命名空间来划分这两个 age
 	lru        *Lru
 	datasource DataSource
+	mu         sync.RWMutex
 }
 
 //NewCache 实例化 Cache
@@ -47,27 +47,31 @@ func GetCache(namespace string) *Cache {
 
 //Set 写入缓存数据
 func (c *Cache) Set(key string, value Byte) {
-	mu.Lock()
-	defer mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.lru.Set(key, value)
 }
 
+//Get 返回缓存数据
 func (c *Cache) Get(key string) (Byte, error) {
 	if key == "" {
 		return nil, fmt.Errorf("key is required")
 	}
+
+	//从缓存中获取
 	value, ok := c.read(key)
 	if ok {
 		return value, nil
 	}
 
-	return c.GetSource(key)
+	//从数据源获取
+	return c.getSource(key)
 }
 
-//Get 获取缓存数据
+//read 返回 lru 中的数据
 func (c *Cache) read(key string) (Byte, bool) {
-	mu.Lock()
-	defer mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	v, ok := c.lru.Get(key)
 
 	if ! ok {
@@ -77,9 +81,9 @@ func (c *Cache) read(key string) (Byte, bool) {
 	return v.(Byte), ok
 }
 
-//GetSource 返回源数据
-func (c *Cache) GetSource(key string) (Byte, error) {
-	//从用户注册的数据源对象中读取数据
+//getSource 返回源数据
+func (c *Cache) getSource(key string) (Byte, error) {
+	//调用用户注册的数据获取函数
 	bytes, err := c.datasource.Get(key)
 	if err != nil {
 		return nil, err
@@ -87,6 +91,8 @@ func (c *Cache) GetSource(key string) (Byte, error) {
 
 	//为了防止返回后的数据被篡改,这里克隆一份数据后返回
 	value := Byte(bytes).Clone()
+
+	//写入缓存
 	c.Set(key, value)
 
 	return value, nil
