@@ -2,6 +2,7 @@ package go_cache
 
 import (
 	"fmt"
+	pb "go_cache/proto"
 	"sync"
 )
 
@@ -23,10 +24,11 @@ var (
 
 //Cache 实现了并发安全的读取缓存
 type Cache struct {
-	namespace  string //缓存的命名空间, 比如学生和动物都有年龄,但一个 age 字段无法存储两个值,因此就需要命名空间来划分这两个 age
-	lru        *Lru
-	datasource DataSource
-	mu         sync.RWMutex
+	namespace   string //缓存的命名空间, 比如学生和动物都有年龄,但一个 age 字段无法存储两个值,因此就需要命名空间来划分这两个 age
+	lru         *Lru
+	datasource  DataSource
+	mu          sync.RWMutex
+	nodeHandler *NodeHandler
 }
 
 //NewCache 实例化 Cache
@@ -40,36 +42,49 @@ func NewCache(namespace string, bytesTotal int64, datasource DataSource) *Cache 
 	return c
 }
 
-//GetCache 返回某个命名空间下的cache
+//GetCache 返回某个命名空间下的 cache 对象
 func GetCache(namespace string) *Cache {
 	return caches[namespace]
 }
 
-//Set 写入缓存数据
+//SetNodeHandler set a nodeHandler for select remote node
+func (c *Cache) SetNodeHandler(nodeHandler *NodeHandler) {
+	if c.nodeHandler == nil {
+		c.nodeHandler = nodeHandler
+	}
+}
+
+//Set 写入数据
 func (c *Cache) Set(key string, value Byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.lru.Set(key, value)
 }
 
-//Get 返回缓存数据
+//Get 返回数据
 func (c *Cache) Get(key string) (Byte, error) {
 	if key == "" {
 		return nil, fmt.Errorf("key is required")
 	}
 
 	//从缓存中获取
-	value, ok := c.read(key)
+	value, ok := c.getCache(key)
 	if ok {
 		return value, nil
 	}
 
-	//从数据源获取
-	return c.getSource(key)
+	//从远程节点获取
+	value, err := c.getRemote(key)
+	if err == nil {
+		return value, err
+	}
+
+	//从本地获取
+	return c.getLocal(key)
 }
 
-//read 返回 lru 中的数据
-func (c *Cache) read(key string) (Byte, bool) {
+//getCache get key from cache
+func (c *Cache) getCache(key string) (Byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	v, ok := c.lru.Get(key)
@@ -81,9 +96,33 @@ func (c *Cache) read(key string) (Byte, bool) {
 	return v.(Byte), ok
 }
 
-//getSource 返回源数据
-func (c *Cache) getSource(key string) (Byte, error) {
-	//调用用户注册的数据获取函数
+//getRemote get key from remote
+func(c *Cache) getRemote(key string) (Byte, error)  {
+	if c.nodeHandler == nil {
+		return nil, fmt.Errorf("nodeHandler is nil")
+	}
+
+	node, ok := c.nodeHandler.NodeSelect(key)
+	if ! ok {
+		return nil, fmt.Errorf("select node faild, key=%s", key)
+	}
+
+	req := &pb.Request{
+		Namespace: c.namespace,
+		Key:   key,
+	}
+	res := &pb.Response{}
+	err := node.Request(req, res)
+	if err != nil {
+		return nil, err
+	}
+
+	return Byte(res.Value), nil
+}
+
+//getLocal get key from local
+func (c *Cache) getLocal(key string) (Byte, error) {
+	//源数据获取
 	bytes, err := c.datasource.Get(key)
 	if err != nil {
 		return nil, err
