@@ -3,10 +3,11 @@ package go_cache
 import (
 	"fmt"
 	pb "go_cache/proto"
+	"log"
 	"sync"
 )
 
-//DataSource 定义了数据源, 在缓存不存在时, 调用Get这个函数得到源数据
+//DataSource 定义了数据源, 在缓存不存在时, 调用这个函数得到源数据
 type DataSource interface {
 	Get(key string) ([]byte, error)
 }
@@ -19,6 +20,7 @@ func (f DataFunc) Get(key string) ([]byte, error) {
 }
 
 var (
+	mux    sync.RWMutex
 	caches = make(map[string]*Cache)
 )
 
@@ -29,10 +31,13 @@ type Cache struct {
 	datasource  DataSource
 	mu          sync.RWMutex
 	nodeHandler *NodeHandler
+	remoteNode  string
 }
 
 //NewCache 实例化 Cache
 func NewCache(namespace string, bytesTotal int64, datasource DataSource) *Cache {
+	mux.Lock()
+	defer mux.Unlock()
 	c := &Cache{
 		namespace:  namespace,
 		lru:        NewLru(bytesTotal, nil),
@@ -42,9 +47,19 @@ func NewCache(namespace string, bytesTotal int64, datasource DataSource) *Cache 
 	return c
 }
 
-//GetCache 返回某个命名空间下的 cache 对象
-func GetCache(namespace string) *Cache {
+//CacheObject 返回某个命名空间下的 cache 对象
+func CacheObject(namespace string) *Cache {
+	mux.Lock()
+	defer mux.Unlock()
 	return caches[namespace]
+}
+
+func (c *Cache) SetRemoteNode(remoteNode string)  {
+	c.remoteNode = remoteNode
+}
+
+func (c *Cache) GetRemoteNode() string  {
+	return c.remoteNode
 }
 
 //SetNodeHandler set a nodeHandler for select remote node
@@ -67,19 +82,25 @@ func (c *Cache) Get(key string) (Byte, error) {
 		return nil, fmt.Errorf("key is required")
 	}
 
+	currentNode := c.nodeHandler.selfHost
+	fmt.Printf("current node is : %s \n", currentNode)
+
 	//从缓存中获取
 	value, ok := c.getCache(key)
 	if ok {
+		log.Printf("[From Cache] current node : %s, search key : %s \n", currentNode, key)
 		return value, nil
 	}
 
 	//从远程节点获取
 	value, err := c.getRemote(key)
 	if err == nil {
+		log.Printf("[From Remote] current node: %s, remote node: %s, search key : %s \n", currentNode,c.GetRemoteNode(), key)
 		return value, err
 	}
 
 	//从本地获取
+	log.Printf("[From Local] current node: %s, search key : %s \n", currentNode, key)
 	return c.getLocal(key)
 }
 
@@ -106,6 +127,8 @@ func(c *Cache) getRemote(key string) (Byte, error)  {
 	if ! ok {
 		return nil, fmt.Errorf("select node faild, key=%s", key)
 	}
+
+	c.SetRemoteNode(node.host)
 
 	req := &pb.Request{
 		Namespace: c.namespace,

@@ -5,7 +5,6 @@ import (
 	"go_cache/consistenthash"
 	pb "go_cache/proto"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -35,17 +34,11 @@ func NewNodeHandler(host string) *NodeHandler {
 	}
 }
 
-// Log info with server name
-func (h *NodeHandler) Log(format string, v ...interface{}) {
-	log.Printf("[Server %s] %s", h.selfHost, fmt.Sprintf(format, v...))
-}
-
 // ServeHTTP handle all http requests
 func (h *NodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, h.basePath) {
 		panic("unexpected urlPath: " + r.URL.Path)
 	}
-	h.Log("%s %s", r.Method, r.URL.Path)
 
 	// /<basepath>/<namespace>/<key> required
 	parts := strings.SplitN(r.URL.Path[len(h.basePath):], "/", 2)
@@ -56,7 +49,7 @@ func (h *NodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	namespace := parts[0]
 	key := parts[1]
 
-	cache := GetCache(namespace)
+	cache := CacheObject(namespace)
 	if cache == nil {
 		http.Error(w, "no such cache: "+namespace, http.StatusNotFound)
 		return
@@ -80,14 +73,14 @@ func (h *NodeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // AddNode add node to hashRing.
-func (h *NodeHandler) AddNode(hosts ...string) {
+func (h *NodeHandler) AddNode(nodes ...string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.hashRing = consistenthash.New(defaultReplicas, nil)
-	h.hashRing.Add(hosts...)
-	h.nodes = make(map[string]*Node, len(hosts))
-	for _, host := range hosts {
-		h.nodes[host] = &Node{baseURL: host + h.basePath}
+	h.hashRing.Add(nodes...)
+	h.nodes = make(map[string]*Node, len(nodes))
+	for _, host := range nodes {
+		h.nodes[host] = &Node{baseURL: host + h.basePath, host: host}
 	}
 }
 
@@ -96,13 +89,13 @@ func (h *NodeHandler) NodeSelect(key string) (*Node, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if host := h.hashRing.Get(key); host != "" && host != h.selfHost {
-		h.Log("select node %s", host)
 		return h.nodes[host], true
 	}
 	return nil, false
 }
 
 type Node struct {
+	host    string
 	baseURL string
 }
 
@@ -113,6 +106,7 @@ func (c *Node) Request(in *pb.Request, out *pb.Response) error {
 		url.QueryEscape(in.GetNamespace()),
 		url.QueryEscape(in.GetKey()),
 	)
+
 	res, err := http.Get(u)
 	if err != nil {
 		return err
