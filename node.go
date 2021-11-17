@@ -5,6 +5,7 @@ import (
 	"go_cache/consistenthash"
 	pb "go_cache/proto"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -84,11 +85,17 @@ func (h *NodeHandler) AddNode(nodes ...string) {
 	}
 }
 
+// Log info with server name
+func (h *NodeHandler) Log(format string, v ...interface{}) {
+	log.Printf("[Server %s] %s", h.selfHost, fmt.Sprintf(format, v...))
+}
+
 // NodeSelect select a node according to key
 func (h *NodeHandler) NodeSelect(key string) (*Node, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if host := h.hashRing.Get(key); host != "" && host != h.selfHost {
+		h.Log("Select node %s \n", host)
 		return h.nodes[host], true
 	}
 	return nil, false

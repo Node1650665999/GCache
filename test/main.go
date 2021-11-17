@@ -24,7 +24,7 @@ var db = map[string]string{
 func Cache() *gocache.Cache {
 	return gocache.NewCache("scores", 2<<10, gocache.DataFunc(
 		func(key string) ([]byte, error) {
-			//log.Printf("[From Local] search key : %s", key)
+			log.Printf("[From Local] search key : %s", key)
 			if v, ok := db[key]; ok {
 				return []byte(v), nil
 			}

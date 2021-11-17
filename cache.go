@@ -3,8 +3,8 @@ package go_cache
 import (
 	"fmt"
 	pb "go_cache/proto"
-	"log"
 	"sync"
+	"time"
 )
 
 //DataSource 定义了数据源, 在缓存不存在时, 调用这个函数得到源数据
@@ -24,6 +24,13 @@ var (
 	caches = make(map[string]*Cache)
 )
 
+// call is an in-flight or completed Do call
+type call struct {
+	wg  sync.WaitGroup
+	val interface{}
+	err error
+}
+
 //Cache 实现了并发安全的读取缓存
 type Cache struct {
 	namespace   string //缓存的命名空间, 比如学生和动物都有年龄,但一个 age 字段无法存储两个值,因此就需要命名空间来划分这两个 age
@@ -32,6 +39,42 @@ type Cache struct {
 	mu          sync.RWMutex
 	nodeHandler *NodeHandler
 	remoteNode  string
+	m           map[string]*call // lazily initialized
+}
+
+//Do 保证fn只被调用一次
+func (cache *Cache) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+	cache.mu.Lock()
+	if cache.m == nil {
+		cache.m = make(map[string]*call)
+	}
+
+	//检测到 fn 已经在执行了
+	if c, ok := cache.m[key]; ok {
+		cache.mu.Unlock()  //释放抢占的锁
+		c.wg.Wait()        //阻塞等待直到fn返回结果(即wg.Down())
+		return c.val, c.err
+	}
+
+	//添加标志位,标识 fn 已经在执行
+	c := new(call)
+	c.wg.Add(1)
+	cache.m[key] = c
+	cache.mu.Unlock()  //释放抢占的锁, 这样其他进程拿到锁后进入被 wg.Wait() 阻塞的状态
+
+	//fn 结果返回后,调用 wg.Done(), 这样被 wg.Wait() 阻塞的代码得以执行
+	c.val, c.err = fn()
+	c.wg.Done()
+
+	//删除标志位
+	//	注意：删除有可能出现缓存穿透的情况,因为有其他的进程可能还等着获取锁,
+	//	因此 sleep 个几秒后等待其他并发进程返回后再删除标志位,这样就不会有漏网之鱼
+	time.Sleep(50 * time.Millisecond)
+	cache.mu.Lock()
+	delete(cache.m, key)
+	cache.mu.Unlock()
+
+	return c.val, c.err
 }
 
 //NewCache 实例化 Cache
@@ -54,63 +97,64 @@ func CacheObject(namespace string) *Cache {
 	return caches[namespace]
 }
 
-func (c *Cache) SetRemoteNode(remoteNode string)  {
-	c.remoteNode = remoteNode
+func (cache *Cache) SetRemoteNode(remoteNode string) {
+	cache.remoteNode = remoteNode
 }
 
-func (c *Cache) GetRemoteNode() string  {
-	return c.remoteNode
+func (cache *Cache) GetRemoteNode() string {
+	return cache.remoteNode
 }
 
 //SetNodeHandler set a nodeHandler for select remote node
-func (c *Cache) SetNodeHandler(nodeHandler *NodeHandler) {
-	if c.nodeHandler == nil {
-		c.nodeHandler = nodeHandler
+func (cache *Cache) SetNodeHandler(nodeHandler *NodeHandler) {
+	if cache.nodeHandler == nil {
+		cache.nodeHandler = nodeHandler
 	}
 }
 
 //Set 写入数据
-func (c *Cache) Set(key string, value Byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.lru.Set(key, value)
+func (cache *Cache) Set(key string, value Byte) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	cache.lru.Set(key, value)
 }
 
 //Get 返回数据
-func (c *Cache) Get(key string) (Byte, error) {
+func (cache *Cache) Get(key string) (Byte, error) {
 	if key == "" {
 		return nil, fmt.Errorf("key is required")
 	}
 
-	currentNode := c.nodeHandler.selfHost
-	fmt.Printf("current node is : %s \n", currentNode)
-
 	//从缓存中获取
-	value, ok := c.getCache(key)
+	value, ok := cache.getCache(key)
 	if ok {
-		log.Printf("[From Cache] current node : %s, search key : %s \n", currentNode, key)
 		return value, nil
 	}
 
-	//从远程节点获取
-	value, err := c.getRemote(key)
-	if err == nil {
-		log.Printf("[From Remote] current node: %s, remote node: %s, search key : %s \n", currentNode,c.GetRemoteNode(), key)
-		return value, err
-	}
+	viewi, err := cache.Do(key, func() (interface{}, error) {
+		//从远程节点获取
+		value, err := cache.getRemote(key)
+		if err == nil {
+			return value, nil
+		}
 
-	//从本地获取
-	log.Printf("[From Local] current node: %s, search key : %s \n", currentNode, key)
-	return c.getLocal(key)
+		//从本地获取
+		return cache.getLocal(key)
+	})
+
+	if err == nil {
+		return viewi.(Byte), nil
+	}
+	return Byte{}, nil
 }
 
 //getCache get key from cache
-func (c *Cache) getCache(key string) (Byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	v, ok := c.lru.Get(key)
+func (cache *Cache) getCache(key string) (Byte, bool) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	v, ok := cache.lru.Get(key)
 
-	if ! ok {
+	if !ok {
 		return Byte{}, false
 	}
 
@@ -118,21 +162,21 @@ func (c *Cache) getCache(key string) (Byte, bool) {
 }
 
 //getRemote get key from remote
-func(c *Cache) getRemote(key string) (Byte, error)  {
-	if c.nodeHandler == nil {
+func (cache *Cache) getRemote(key string) (Byte, error) {
+	if cache.nodeHandler == nil {
 		return nil, fmt.Errorf("nodeHandler is nil")
 	}
 
-	node, ok := c.nodeHandler.NodeSelect(key)
-	if ! ok {
+	node, ok := cache.nodeHandler.NodeSelect(key)
+	if !ok {
 		return nil, fmt.Errorf("select node faild, key=%s", key)
 	}
 
-	c.SetRemoteNode(node.host)
+	cache.SetRemoteNode(node.host)
 
 	req := &pb.Request{
-		Namespace: c.namespace,
-		Key:   key,
+		Namespace: cache.namespace,
+		Key:       key,
 	}
 	res := &pb.Response{}
 	err := node.Request(req, res)
@@ -144,9 +188,9 @@ func(c *Cache) getRemote(key string) (Byte, error)  {
 }
 
 //getLocal get key from local
-func (c *Cache) getLocal(key string) (Byte, error) {
+func (cache *Cache) getLocal(key string) (Byte, error) {
 	//源数据获取
-	bytes, err := c.datasource.Get(key)
+	bytes, err := cache.datasource.Get(key)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +199,7 @@ func (c *Cache) getLocal(key string) (Byte, error) {
 	value := Byte(bytes).Clone()
 
 	//写入缓存
-	c.Set(key, value)
+	cache.Set(key, value)
 
 	return value, nil
 }
